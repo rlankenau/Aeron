@@ -19,7 +19,7 @@ import uk.co.real_logic.agrona.IoUtil;
 import uk.co.real_logic.agrona.concurrent.UnsafeBuffer;
 
 import java.io.File;
-import java.util.UUID;
+import java.lang.management.ManagementFactory;
 
 import static java.lang.System.getProperty;
 
@@ -47,7 +47,8 @@ public class CommonContext implements AutoCloseable
 
     static
     {
-        String aeronDirName = IoUtil.tmpDirName() + "aeron";
+        final String aeronDirSuffix = String.format("aeron-%s/default", System.getProperty("user.name"));
+        String aeronDirName = IoUtil.tmpDirName() + aeronDirSuffix;
 
         // Use shared memory on Linux to avoid contention on the page cache.
         if ("Linux".equalsIgnoreCase(System.getProperty("os.name")))
@@ -56,7 +57,7 @@ public class CommonContext implements AutoCloseable
 
             if (devShmDir.exists())
             {
-                aeronDirName = "/dev/shm/aeron";
+                aeronDirName = "/dev/shm/" + aeronDirSuffix;
             }
         }
 
@@ -65,8 +66,9 @@ public class CommonContext implements AutoCloseable
 
     public static String generateEmbeddedDirName()
     {
-        final String randomDirName = UUID.randomUUID().toString();
-        String aeronDirName = IoUtil.tmpDirName() + "aeron-" + randomDirName;
+        final String aeronDirSuffix = String.format("aeron-%s/embedded/%s",
+                System.getProperty("user.name"), ManagementFactory.getRuntimeMXBean().getName());
+        String aeronDirName = IoUtil.tmpDirName() + aeronDirSuffix;
 
         // Use shared memory on Linux to avoid contention on the page cache.
         if ("Linux".equalsIgnoreCase(System.getProperty("os.name")))
@@ -75,7 +77,7 @@ public class CommonContext implements AutoCloseable
 
             if (devShmDir.exists())
             {
-                aeronDirName = "/dev/shm/aeron-" + randomDirName;
+                aeronDirName = "/dev/shm/" + aeronDirSuffix;
             }
         }
 

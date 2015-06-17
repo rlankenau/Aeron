@@ -27,9 +27,12 @@ import uk.co.real_logic.aeron.driver.exceptions.ConfigurationException;
 import uk.co.real_logic.aeron.driver.media.TransportPoller;
 import uk.co.real_logic.agrona.IoUtil;
 import uk.co.real_logic.agrona.LangUtil;
+import uk.co.real_logic.agrona.MutableDirectBuffer;
 import uk.co.real_logic.agrona.TimerWheel;
 import uk.co.real_logic.agrona.concurrent.*;
+import uk.co.real_logic.agrona.concurrent.broadcast.BroadcastReceiver;
 import uk.co.real_logic.agrona.concurrent.broadcast.BroadcastTransmitter;
+import uk.co.real_logic.agrona.concurrent.broadcast.CopyBroadcastReceiver;
 import uk.co.real_logic.agrona.concurrent.ringbuffer.ManyToOneRingBuffer;
 import uk.co.real_logic.agrona.concurrent.ringbuffer.RingBuffer;
 
@@ -76,6 +79,11 @@ public final class MediaDriver implements AutoCloseable
      */
     public static final String DIRS_DELETE_ON_EXIT_PROP_NAME = "aeron.dir.delete.on.exit";
 
+    /**
+     * Clean the media driver directories at startup
+     */
+    public static final String DIRS_DELETE_ON_START_PROP_NAME = "aeron.dir.delete.on.start";
+
     private final File parentDirectory;
     private final List<AgentRunner> runners;
     private final Context ctx;
@@ -106,18 +114,20 @@ public final class MediaDriver implements AutoCloseable
 
         parentDirectory = new File(ctx.dirName());
 
+        cleanupOnStart();
+
         ensureDirectoriesAreRecreated();
 
         validateSufficientSocketBufferLengths(ctx);
 
         ctx.unicastSenderFlowControl(Configuration::unicastFlowControlStrategy)
-            .multicastSenderFlowControl(Configuration::multicastFlowControlStrategy)
-            .conductorTimerWheel(Configuration.newConductorTimerWheel())
-            .toConductorFromReceiverCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
-            .toConductorFromSenderCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
-            .receiverCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
-            .senderCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
-            .conclude();
+                .multicastSenderFlowControl(Configuration::multicastFlowControlStrategy)
+                .conductorTimerWheel(Configuration.newConductorTimerWheel())
+                .toConductorFromReceiverCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
+                .toConductorFromSenderCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
+                .receiverCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
+                .senderCommandQueue(new OneToOneConcurrentArrayQueue<>(Configuration.CMD_QUEUE_CAPACITY))
+                .conclude();
 
         final AtomicCounter driverExceptions = ctx.systemCounters().driverExceptions();
 
@@ -136,8 +146,8 @@ public final class MediaDriver implements AutoCloseable
         {
             case SHARED:
                 runners = Collections.singletonList(
-                    new AgentRunner(ctx.sharedIdleStrategy, ctx.exceptionConsumer(), driverExceptions,
-                        new CompositeAgent(sender, new CompositeAgent(receiver, driverConductor)))
+                        new AgentRunner(ctx.sharedIdleStrategy, ctx.exceptionConsumer(), driverExceptions,
+                                new CompositeAgent(sender, new CompositeAgent(receiver, driverConductor)))
                 );
                 break;
 
@@ -152,9 +162,9 @@ public final class MediaDriver implements AutoCloseable
             default:
             case DEDICATED:
                 runners = Arrays.asList(
-                    new AgentRunner(ctx.senderIdleStrategy, ctx.exceptionConsumer(), driverExceptions, sender),
-                    new AgentRunner(ctx.receiverIdleStrategy, ctx.exceptionConsumer(), driverExceptions, receiver),
-                    new AgentRunner(ctx.conductorIdleStrategy, ctx.exceptionConsumer(), driverExceptions, driverConductor)
+                        new AgentRunner(ctx.senderIdleStrategy, ctx.exceptionConsumer(), driverExceptions, sender),
+                        new AgentRunner(ctx.receiverIdleStrategy, ctx.exceptionConsumer(), driverExceptions, receiver),
+                        new AgentRunner(ctx.conductorIdleStrategy, ctx.exceptionConsumer(), driverExceptions, driverConductor)
                 );
                 break;
         }
@@ -219,7 +229,7 @@ public final class MediaDriver implements AutoCloseable
             freeSocketsForReuseOnWindows();
             ctx.close();
 
-            deleteDirectories();
+            cleanupOnExit();
         }
         catch (final Exception ex)
         {
@@ -246,12 +256,12 @@ public final class MediaDriver implements AutoCloseable
     private MediaDriver start()
     {
         runners.forEach(
-            (runner) ->
-            {
-                final Thread thread = new Thread(runner);
-                thread.setName(runner.agent().roleName());
-                thread.start();
-            });
+                (runner) ->
+                {
+                    final Thread thread = new Thread(runner);
+                    thread.setName(runner.agent().roleName());
+                    thread.start();
+                });
 
         return this;
     }
@@ -295,25 +305,53 @@ public final class MediaDriver implements AutoCloseable
         catch (final IOException ex)
         {
             throw new RuntimeException(
-                String.format("probe socket: %s", ex.toString()), ex);
+                    String.format("probe socket: %s", ex.toString()), ex);
         }
     }
 
     private void ensureDirectoriesAreRecreated()
     {
         final BiConsumer<String, String> callback =
-            (path, name) ->
-            {
-                if (ctx.warnIfDirectoriesExist())
+                (path, name) ->
                 {
-                    System.err.println("WARNING: " + name + " directory already exists: " + path);
-                }
-            };
+                    if (ctx.warnIfDirectoriesExist())
+                    {
+                        System.err.println("WARNING: " + name + " directory already exists: " + path);
+                    }
+                };
 
         IoUtil.ensureDirectoryIsRecreated(parentDirectory, "aeron", callback);
     }
 
-    private void deleteDirectories() throws Exception
+    private void cleanupOnStart()
+    {
+
+        if (parentDirectory.exists())
+        {
+            if (ctx.cncFile().exists())
+            {
+                /* TODO: Change this to actually check if the CnC indicates a driver is alive. */
+
+                if (false)
+                {
+                    System.err.print("Error: CnC file in " + parentDirectory + " indicates another driver is alive.");
+                    throw new RuntimeException("Another driver is already active in " + parentDirectory);
+                }
+                else if (!ctx.dirsDeleteOnStart())
+                {
+                    throw new RuntimeException(
+                            "Stale driver files are present, but the media driver doesn't support resume," +
+                                    "and " + DIRS_DELETE_ON_START_PROP_NAME + " is False.");
+                }
+            }
+            if(ctx.dirsDeleteOnStart())
+            {
+                IoUtil.delete(parentDirectory, false);
+            }
+        }
+    }
+
+    private void cleanupOnExit() throws Exception
     {
         if (ctx.dirsDeleteOnExit())
         {
@@ -369,6 +407,7 @@ public final class MediaDriver implements AutoCloseable
         private Consumer<String> eventConsumer;
         private ThreadingMode threadingMode;
         private boolean dirsDeleteOnExit;
+        private boolean dirsDeleteOnStart;
 
         private LossGenerator dataLossGenerator;
         private LossGenerator controlLossGenerator;
@@ -391,6 +430,7 @@ public final class MediaDriver implements AutoCloseable
             warnIfDirectoriesExist = true;
 
             dirsDeleteOnExit(getBoolean(DIRS_DELETE_ON_EXIT_PROP_NAME));
+            dirsDeleteOnStart(getBoolean(DIRS_DELETE_ON_START_PROP_NAME));
         }
 
         public Context conclude()
@@ -719,6 +759,12 @@ public final class MediaDriver implements AutoCloseable
             return this;
         }
 
+        public Context dirsDeleteOnStart(final boolean dirsDeleteOnStart)
+        {
+            this.dirsDeleteOnStart = dirsDeleteOnStart;
+            return this;
+        }
+
         /**
          * Set whether or not this application will attempt to delete the Aeron directories when exiting.
          *
@@ -925,6 +971,11 @@ public final class MediaDriver implements AutoCloseable
         public SystemCounters systemCounters()
         {
             return systemCounters;
+        }
+
+        public boolean dirsDeleteOnStart()
+        {
+            return dirsDeleteOnStart;
         }
 
         /**
