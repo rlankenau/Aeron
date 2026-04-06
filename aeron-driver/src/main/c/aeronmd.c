@@ -146,6 +146,9 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    printf("conductor started\n");
+    fflush(stdout);
+
     while (is_running())
     {
         aeron_driver_main_idle_strategy(driver, aeron_driver_main_do_work(driver));
